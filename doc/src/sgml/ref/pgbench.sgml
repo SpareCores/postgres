@@ -845,6 +845,34 @@ pgbench <optional> <replaceable>options</replaceable> </optional> <replaceable>d
       </listitem>
      </varlistentry>
 
+     <varlistentry id="pgbench-option-pipeline-depth">
+      <term><option>--pipeline-depth=<replaceable>num</replaceable></option></term>
+      <listitem>
+       <para>
+        Keep up to <replaceable>num</replaceable> transactions in flight per
+        client using <xref linkend="libpq-pipeline-mode"/>.  When a response
+        for an in-flight transaction arrives, another transaction is started
+        immediately so the window stays filled.  Unlike
+        <literal>\startpipeline</literal>/<literal>\endpipeline</literal>,
+        which batch-send one script run and then wait for all results, this
+        option maintains a continuous sliding window across many script runs.
+        A value of 0 (the default) disables the feature.
+       </para>
+       <para>
+        Requires <option>-M extended</option> or <option>-M prepared</option>.
+        Cannot be combined with <option>-C</option>, <option>-R</option>,
+        <option>-L</option>, <option>--max-tries</option> other than 1, or
+        scripts that use pipeline metacommands.
+       </para>
+       <para>
+        When a run duration is limited with <option>-T</option>, no new
+        transactions are started after the deadline, but transactions already
+        in flight are allowed to complete and are included in the reported
+        statistics (the same rule as for non-pipelined runs).
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="pgbench-option-progress-timestamp">
       <term><option>--progress-timestamp</option></term>
       <listitem>
@@ -1420,6 +1448,9 @@ SELECT 4 AS four \; SELECT 5 AS five \aset
         for the results of previous statements.  See
         <xref linkend="libpq-pipeline-mode"/> for more details.
         Pipeline mode requires the use of extended query protocol.
+        These metacommands implement a send-all-then-wait batch for one script
+        run; for a continuous sliding window of in-flight transactions, use
+        <option>--pipeline-depth</option> instead.
      </para>
     </listitem>
    </varlistentry>

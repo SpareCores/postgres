@@ -176,6 +176,13 @@ static int	duration = 0;		/* duration in seconds */
 static int64 end_time = 0;		/* when to stop in micro seconds, under -T */
 
 /*
+ * Continuous (sliding-window) pipeline depth: keep this many transactions in
+ * flight per client.  0 disables the feature (default).  Distinct from script
+ * metacommands \startpipeline/\endpipeline, which batch-sync one script run.
+ */
+static int	pipeline_depth = 0;
+
+/*
  * scaling factor. for example, scale = 10 will make 1000000 tuples in
  * pgbench_accounts table.
  */
@@ -549,6 +556,12 @@ typedef enum
 	 */
 	CSTATE_START_COMMAND,
 	CSTATE_WAIT_RESULT,
+	/*
+	 * CSTATE_WAIT_PIPELINE_TX: under --pipeline-depth, wait until at least one
+	 * in-flight transaction's Sync result is available, then record its stats
+	 * and either start another txn or keep draining.
+	 */
+	CSTATE_WAIT_PIPELINE_TX,
 	CSTATE_SLEEP,
 	CSTATE_END_COMMAND,
 	CSTATE_SKIP_COMMAND,
@@ -627,6 +640,30 @@ typedef struct
 	pg_time_usec_t sleep_until; /* scheduled start time of next cmd */
 	pg_time_usec_t txn_begin;	/* used for measuring schedule lag times */
 	pg_time_usec_t stmt_begin;	/* used for measuring statement latencies */
+
+	/*
+	 * Sliding-window pipeline (--pipeline-depth): FIFO of in-flight txn
+	 * start times / script indexes.  pipe_count is the number of Syncs
+	 * sent but not yet fully received.
+	 */
+	pg_time_usec_t *pipe_txn_begin; /* size pipeline_depth */
+	pg_time_usec_t *pipe_txn_scheduled;
+	int		   *pipe_use_file;
+	int			pipe_head;		/* next enqueue index */
+	int			pipe_tail;		/* next dequeue index */
+	int			pipe_count;		/* # in-flight transactions */
+	pg_time_usec_t pipe_stall_deadline; /* give up waiting after cutoff */
+
+	/*
+	 * Sub-state for drainPipelineTxResult(): whether the next PQgetResult()
+	 * call is expected to return the NULL that terminates the result just
+	 * fetched, and whether that result was a PGRES_PIPELINE_SYNC (meaning
+	 * we're done with this in-flight transaction once its terminator
+	 * arrives).  Persisted across calls so draining can safely yield
+	 * mid-transaction whenever the next message hasn't arrived yet.
+	 */
+	bool		pipe_awaiting_null;
+	bool		pipe_saw_sync;
 
 	/* whether client prepared each command of each script */
 	bool	  **prepared;
@@ -963,6 +1000,7 @@ usage(void)
 		   "  --log-prefix=PREFIX      prefix for transaction time log file\n"
 		   "                           (default: \"pgbench_log\")\n"
 		   "  --max-tries=NUM          max number of tries to run transaction (default: 1)\n"
+		   "  --pipeline-depth=NUM     keep NUM transactions in flight per client (0=off)\n"
 		   "  --progress-timestamp     use Unix epoch timestamps for progress\n"
 		   "  --random-seed=SEED       set random seed (\"time\", \"rand\", integer)\n"
 		   "  --sampling-rate=NUM      fraction of transactions to log (e.g., 0.01 for 1%%)\n"
@@ -3109,6 +3147,163 @@ prepareCommand(CState *st, int command_num)
 }
 
 /*
+ * Prepare every SQL command in every script.  Must be called while not in
+ * pipeline mode (PQprepare is synchronous).
+ */
+static void
+prepareAllCommands(CState *st)
+{
+	int			save_file = st->use_file;
+	int			save_cmd = st->command;
+
+	for (int i = 0; i < num_scripts; i++)
+	{
+		Command   **commands = sql_script[i].commands;
+
+		st->use_file = i;
+		for (int j = 0; commands[j] != NULL; j++)
+		{
+			st->command = j;
+			prepareCommand(st, j);
+		}
+	}
+
+	st->use_file = save_file;
+	st->command = save_cmd;
+}
+
+/*
+ * True if this client may start another transaction under --pipeline-depth.
+ *
+ * Under -T, stop starting once the timer has fired (in-flight work is still
+ * drained and counted).  Under -t, stop once started+completed would exceed
+ * the per-client limit.
+ */
+static bool
+pipelineCanStartMore(CState *st)
+{
+	if (timer_exceeded)
+		return false;
+
+	if (duration <= 0 && nxacts > 0 &&
+		st->cnt + st->pipe_count >= nxacts)
+		return false;
+
+	return st->pipe_count < pipeline_depth;
+}
+
+/*
+ * Enqueue start-time metadata for a transaction that was just Sync'd into
+ * the sliding-window pipeline.
+ */
+static void
+pipelineEnqueue(CState *st)
+{
+	Assert(pipeline_depth > 0);
+	Assert(st->pipe_count < pipeline_depth);
+
+	st->pipe_txn_begin[st->pipe_head] = st->txn_begin;
+	st->pipe_txn_scheduled[st->pipe_head] = st->txn_scheduled;
+	st->pipe_use_file[st->pipe_head] = st->use_file;
+	st->pipe_head = (st->pipe_head + 1) % pipeline_depth;
+	st->pipe_count++;
+}
+
+/*
+ * Dequeue metadata for a completed pipelined transaction into st->txn_*.
+ */
+static void
+pipelineDequeue(CState *st)
+{
+	Assert(pipeline_depth > 0);
+	Assert(st->pipe_count > 0);
+
+	st->txn_begin = st->pipe_txn_begin[st->pipe_tail];
+	st->txn_scheduled = st->pipe_txn_scheduled[st->pipe_tail];
+	st->use_file = st->pipe_use_file[st->pipe_tail];
+	st->pipe_tail = (st->pipe_tail + 1) % pipeline_depth;
+	st->pipe_count--;
+}
+
+/*
+ * Allocate per-client FIFO buffers used by --pipeline-depth.
+ */
+static void
+initPipelineBuffers(CState *st)
+{
+	Assert(pipeline_depth > 0);
+	st->pipe_txn_begin = pg_malloc0(sizeof(pg_time_usec_t) * pipeline_depth);
+	st->pipe_txn_scheduled = pg_malloc0(sizeof(pg_time_usec_t) * pipeline_depth);
+	st->pipe_use_file = pg_malloc0(sizeof(int) * pipeline_depth);
+	st->pipe_head = 0;
+	st->pipe_tail = 0;
+	st->pipe_count = 0;
+	st->pipe_stall_deadline = 0;
+	st->pipe_awaiting_null = false;
+	st->pipe_saw_sync = false;
+}
+
+/*
+ * Ensure all pending protocol data has left the client socket.  PQflush()
+ * returns 1 when the socket would block; a single call is not enough under
+ * high concurrency / deep pipelines and can leave Sync messages unsent so
+ * the client waits forever for results that will never arrive.
+ *
+ * Gives up after ~10s so a wedged TCP peer cannot hang the run forever.
+ */
+static bool
+pipelineFlush(CState *st)
+{
+	pg_time_usec_t deadline = pg_time_now() + INT64CONST(10000000);
+
+	for (;;)
+	{
+		int			r = PQflush(st->con);
+		int			sock;
+
+		if (r == 0)
+			return true;
+		if (r < 0)
+			return false;
+		if (pg_time_now() >= deadline)
+			return false;
+
+		sock = PQsocket(st->con);
+		if (sock < 0)
+			return false;
+
+#ifdef POLL_USING_PPOLL
+		{
+			struct pollfd pfd = {.fd = sock,.events = POLLOUT};
+
+			if (poll(&pfd, 1, 200) < 0)
+			{
+				if (errno == EINTR)
+					continue;
+				return false;
+			}
+		}
+#else
+		{
+			fd_set		wfds;
+			struct timeval tv;
+
+			FD_ZERO(&wfds);
+			FD_SET(sock, &wfds);
+			tv.tv_sec = 0;
+			tv.tv_usec = 200000;
+			if (select(sock + 1, NULL, &wfds, NULL, &tv) < 0)
+			{
+				if (errno == EINTR)
+					continue;
+				return false;
+			}
+		}
+#endif
+	}
+}
+
+/*
  * Prepare all the commands in the script that come after the \startpipeline
  * that's at position st->command, and the first \endpipeline we find.
  *
@@ -3269,6 +3464,131 @@ canContinueOnError(EStatus estatus)
 }
 
 /*
+ * Drain the results of one in-flight pipelined transaction
+ * (--pipeline-depth), one message at a time, never calling PQgetResult()
+ * unless PQisBusy() has just confirmed it won't block.
+ *
+ * readCommandResponse() (below) instead peeks one result ahead
+ * unconditionally to tell whether the current one is the last; that's fine
+ * when the whole remaining chain up to the pipeline Sync is already known
+ * to be fully buffered (as in the classic \startpipeline/\endpipeline
+ * batch usage, entered well after everything was flushed).  Under
+ * --pipeline-depth, though, we get called as soon as PQisBusy() says the
+ * *first* result is ready, and the very next message can legitimately
+ * still be in flight -- especially with network latency and many
+ * concurrently pipelined transactions.  Calling PQgetResult() there would
+ * block inside libpq, bypassing pgbench's non-blocking dispatch loop (and
+ * the -T cutoff stall watchdog) entirely, which is exactly what caused
+ * clients to hang indefinitely instead of draining and exiting at cutoff.
+ *
+ * Progress is tracked in st->pipe_awaiting_null / st->pipe_saw_sync so a
+ * partially drained transaction can be resumed cleanly on the next call
+ * once more input has arrived.
+ *
+ * Returns:
+ *   1  once a full Sync boundary (one in-flight transaction) is drained;
+ *      st->num_syncs has already been decremented.
+ *   0  if there isn't enough data buffered yet to make further progress;
+ *      the caller should return to the event loop and retry later.
+ *  -1  on error; st->estatus is set, and st->state is set to CSTATE_ABORTED
+ *      if the connection itself is unusable.
+ */
+static int
+drainPipelineTxResult(CState *st)
+{
+	for (;;)
+	{
+		PGresult   *res;
+
+		if (PQisBusy(st->con))
+		{
+			if (!PQconsumeInput(st->con))
+			{
+				commandFailed(st, "SQL", "perhaps the backend died while processing");
+				st->state = CSTATE_ABORTED;
+				return -1;
+			}
+			if (PQisBusy(st->con))
+				return 0;		/* not enough data yet; come back later */
+		}
+
+		/* Safe: PQisBusy() just confirmed this won't block. */
+		res = PQgetResult(st->con);
+
+		if (st->pipe_awaiting_null)
+		{
+			/* Expecting the NULL that terminates the previous result. */
+			Assert(res == NULL);
+			st->pipe_awaiting_null = false;
+			if (st->pipe_saw_sync)
+			{
+				st->pipe_saw_sync = false;
+				return 1;		/* one in-flight transaction fully drained */
+			}
+			continue;
+		}
+
+		if (res == NULL)
+		{
+			/* Nothing pending and we weren't expecting a terminator. */
+			continue;
+		}
+
+		switch (PQresultStatus(res))
+		{
+			case PGRES_COMMAND_OK:
+			case PGRES_EMPTY_QUERY:
+			case PGRES_TUPLES_OK:
+				/* nothing to do with the actual data under --pipeline-depth */
+				break;
+
+			case PGRES_PIPELINE_SYNC:
+				pg_log_debug("client %d pipeline sync received, ongoing syncs: %d",
+							 st->id, st->num_syncs);
+				st->num_syncs--;
+				st->pipe_saw_sync = true;
+				break;
+
+			case PGRES_COPY_IN:
+			case PGRES_COPY_OUT:
+			case PGRES_COPY_BOTH:
+				pg_log_error("COPY is not supported in pgbench, aborting");
+				PQendcopy(st->con);
+				PQclear(res);
+				discardAvailableResults(st);
+				st->estatus = ESTATUS_OTHER_SQL_ERROR;
+				st->state = CSTATE_ABORTED;
+				return -1;
+
+			case PGRES_NONFATAL_ERROR:
+			case PGRES_FATAL_ERROR:
+				st->estatus = getSQLErrorStatus(st, PQresultErrorField(res,
+																		 PG_DIAG_SQLSTATE));
+				if (!(canRetryError(st->estatus) || canContinueOnError(st->estatus)))
+					pg_log_error("client %d aborted: %s", st->id,
+								 PQresultErrorMessage(res));
+				else if (verbose_errors)
+					commandError(st, PQresultErrorMessage(res));
+				PQclear(res);
+				discardAvailableResults(st);
+				return -1;
+
+			default:
+				pg_log_error("client %d aborted: %s", st->id,
+							 PQresultErrorMessage(res));
+				PQclear(res);
+				discardAvailableResults(st);
+				st->estatus = ESTATUS_OTHER_SQL_ERROR;
+				st->state = CSTATE_ABORTED;
+				return -1;
+		}
+
+		PQclear(res);
+		st->pipe_awaiting_null = true;
+	}
+}
+
+/*
  * Process query response from the backend.
  *
  * If varprefix is not NULL, it's the variable name prefix where to store
@@ -3362,10 +3682,18 @@ readCommandResponse(CState *st, MetaCommand meta, char *varprefix)
 				break;
 
 			case PGRES_PIPELINE_SYNC:
-				pg_log_debug("client %d pipeline ending, ongoing syncs: %d",
+				pg_log_debug("client %d pipeline sync received, ongoing syncs: %d",
 							 st->id, st->num_syncs);
 				st->num_syncs--;
-				if (st->num_syncs == 0 && PQexitPipelineMode(st->con) != 1)
+
+				/*
+				 * Under --pipeline-depth, stay in pipeline mode across Syncs
+				 * so we can keep a sliding window of in-flight transactions.
+				 * Exit only when the window is fully drained (see
+				 * CSTATE_WAIT_PIPELINE_TX).
+				 */
+				if (st->num_syncs == 0 && pipeline_depth == 0 &&
+					PQexitPipelineMode(st->con) != 1)
 					pg_log_error("client %d failed to exit pipeline mode: %s", st->id,
 								 PQresultErrorMessage(res));
 				break;
@@ -3706,15 +4034,40 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 							 st->id, sql_script[st->use_file].desc);
 
 				/*
-				 * If time is over, we're done; otherwise, get ready to start
-				 * a new transaction, or to get throttled if that's requested.
+				 * If time is over, we're done — but under --pipeline-depth
+				 * first drain any transactions already in flight so their
+				 * latencies are recorded correctly.
 				 */
-				st->state = timer_exceeded ? CSTATE_FINISHED :
-					throttle_delay > 0 ? CSTATE_PREPARE_THROTTLE : CSTATE_START_TX;
+				if (timer_exceeded)
+				{
+					if (pipeline_depth > 0 && st->pipe_count > 0)
+					{
+						if (!pipelineFlush(st))
+						{
+							pg_log_error("client %d aborted: failed to flush pipeline: %s",
+										 st->id, PQerrorMessage(st->con));
+							st->state = CSTATE_ABORTED;
+						}
+						else
+							st->state = CSTATE_WAIT_PIPELINE_TX;
+					}
+					else
+						st->state = CSTATE_FINISHED;
+				}
+				else
+					st->state =
+						throttle_delay > 0 ? CSTATE_PREPARE_THROTTLE : CSTATE_START_TX;
 				break;
 
 				/* Start new transaction (script) */
 			case CSTATE_START_TX:
+				/*
+				 * Under --pipeline-depth we may start several transactions in
+				 * one advanceConnectionState() call; force a fresh timestamp
+				 * for each so latency/lag stats stay meaningful.
+				 */
+				if (pipeline_depth > 0)
+					now = 0;
 				pg_time_now_lazy(&now);
 
 				/* establish connection if needed, i.e. under --connect */
@@ -3759,6 +4112,26 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 				if (!throttle_delay)
 					st->txn_scheduled = now;
+
+				/*
+				 * Continuous pipeline: enter pipeline mode once, after any
+				 * necessary prepares (which cannot run in pipeline mode).
+				 */
+				if (pipeline_depth > 0)
+				{
+					if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
+					{
+						if (querymode == QUERY_PREPARED)
+							prepareAllCommands(st);
+						if (PQenterPipelineMode(st->con) == 0)
+						{
+							pg_log_error("client %d aborted: failed to enter pipeline mode: %s",
+										 st->id, PQerrorMessage(st->con));
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+					}
+				}
 
 				/* Begin with the first command */
 				st->state = CSTATE_START_COMMAND;
@@ -3855,7 +4228,56 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 				if (command == NULL)
 				{
-					if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
+					if (pipeline_depth > 0)
+					{
+						/*
+						 * End of one script under continuous pipelining:
+						 * Sync this transaction into the window, then either
+						 * start another (keep the window full) or wait for a
+						 * completion.
+						 */
+						if (PQpipelineStatus(st->con) != PQ_PIPELINE_ON)
+						{
+							pg_log_error("client %d aborted: continuous pipeline not active at script end",
+										 st->id);
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+						if (PQsendPipelineSync(st->con) == 0)
+						{
+							pg_log_error("client %d aborted: failed to send a pipeline sync: %s",
+										 st->id, PQerrorMessage(st->con));
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+						st->num_syncs++;
+						pipelineEnqueue(st);
+
+						/*
+						 * Always flush after Sync so the server can execute
+						 * and reply.  Without this, high concurrency can
+						 * deadlock: client waits for results while Sync still
+						 * sits in the send buffer.
+						 */
+						if (!pipelineFlush(st))
+						{
+							pg_log_error("client %d aborted: failed to flush pipeline: %s",
+										 st->id, PQerrorMessage(st->con));
+							st->state = CSTATE_ABORTED;
+							break;
+						}
+
+						if (pipelineCanStartMore(st))
+							st->state = CSTATE_CHOOSE_SCRIPT;
+						else
+						{
+							st->pipe_stall_deadline = 0;
+							st->state = CSTATE_WAIT_PIPELINE_TX;
+							/* Must wait for server; yield to thread loop. */
+							return;
+						}
+					}
+					else if (PQpipelineStatus(st->con) == PQ_PIPELINE_OFF)
 						st->state = CSTATE_END_TX;
 					else
 					{
@@ -4028,6 +4450,125 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 						break;
 				}
 				break;
+
+				/*
+				 * Wait for at least one in-flight pipelined transaction
+				 * (--pipeline-depth) to complete, record its stats, then
+				 * either refill the window or finish draining.
+				 */
+			case CSTATE_WAIT_PIPELINE_TX:
+				{
+					Assert(pipeline_depth > 0);
+					Assert(st->pipe_count > 0);
+
+					pg_log_debug("client %d receiving pipeline txn", st->id);
+
+					/*
+					 * After -T/-t cutoff, do not wait forever for Syncs that
+					 * may never arrive (lost flush / pipeline deadlock).
+					 * Retry a flush, then abandon remaining in-flight txns.
+					 */
+					if (timer_exceeded ||
+						(duration <= 0 && nxacts > 0 &&
+						 st->cnt + st->pipe_count >= nxacts &&
+						 !pipelineCanStartMore(st)))
+					{
+						pg_time_now_lazy(&now);
+						if (st->pipe_stall_deadline == 0)
+							st->pipe_stall_deadline = now + INT64CONST(3000000);
+						else if (now >= st->pipe_stall_deadline)
+						{
+							bool		flushed = pipelineFlush(st);
+
+							(void) PQconsumeInput(st->con);
+							if (!flushed || PQisBusy(st->con))
+							{
+								pg_log_error("client %d: abandoning %d in-flight pipelined transactions after post-cutoff stall",
+											 st->id, st->pipe_count);
+								st->pipe_count = 0;
+								st->num_syncs = 0;
+								st->pipe_head = st->pipe_tail = 0;
+								st->pipe_stall_deadline = 0;
+								st->pipe_awaiting_null = false;
+								st->pipe_saw_sync = false;
+								finishCon(st);
+								st->state = CSTATE_FINISHED;
+								break;
+							}
+							/* Input became available — keep draining. */
+							st->pipe_stall_deadline = now + INT64CONST(3000000);
+						}
+					}
+
+					/*
+					 * Drain one message at a time, never blocking inside
+					 * libpq: drainPipelineTxResult() checks PQisBusy()
+					 * before every PQgetResult() call, so it can yield back
+					 * here (returning 0) whenever the next message hasn't
+					 * arrived yet, instead of getting stuck waiting for it
+					 * with no timeout.  See its comment for why this
+					 * matters and readCommandResponse() cannot be reused
+					 * here.
+					 */
+					switch (drainPipelineTxResult(st))
+					{
+						case -1:
+							if (st->state == CSTATE_ABORTED)
+								break;
+							if (canRetryError(st->estatus) || canContinueOnError(st->estatus))
+								st->state = CSTATE_ERROR;
+							else
+								st->state = CSTATE_ABORTED;
+							break;
+						case 0:
+							return;	/* not enough data yet */
+						default:
+							break;	/* one Sync boundary fully drained */
+					}
+					if (st->state == CSTATE_ERROR || st->state == CSTATE_ABORTED)
+						break;
+
+					/* One in-flight transaction completed. */
+					pipelineDequeue(st);
+					st->pipe_stall_deadline = 0;
+					st->estatus = ESTATUS_NO_ERROR;
+					/* Fresh clock sample per completion (see START_TX). */
+					now = 0;
+					processXactStats(thread, st, &now, false, agg);
+
+					if (pipelineCanStartMore(st))
+					{
+						st->state = CSTATE_CHOOSE_SCRIPT;
+						/*
+						 * Return so other clients get a turn; the next
+						 * advance will refill the pipeline window.
+						 */
+						return;
+					}
+
+					if (st->pipe_count > 0)
+					{
+						/* Still draining; stay in this state. */
+						break;
+					}
+
+					/* Window empty — leave pipeline mode. */
+					if (PQpipelineStatus(st->con) != PQ_PIPELINE_OFF &&
+						PQexitPipelineMode(st->con) != 1)
+					{
+						pg_log_error("client %d failed to exit pipeline mode: %s",
+									 st->id, PQerrorMessage(st->con));
+						st->state = CSTATE_ABORTED;
+						break;
+					}
+
+					if (timer_exceeded ||
+						(duration <= 0 && nxacts > 0 && st->cnt >= nxacts))
+						st->state = CSTATE_FINISHED;
+					else
+						st->state = CSTATE_CHOOSE_SCRIPT;
+					return;
+				}
 
 				/*
 				 * Wait for the current SQL command to complete
@@ -4510,6 +5051,11 @@ executeMetaCommand(CState *st, pg_time_usec_t *now)
 		 * In pipeline mode, we use a workflow based on libpq pipeline
 		 * functions.
 		 */
+		if (pipeline_depth > 0)
+		{
+			commandFailed(st, "startpipeline", "cannot use \\startpipeline with --pipeline-depth");
+			return CSTATE_ABORTED;
+		}
 		if (querymode == QUERY_SIMPLE)
 		{
 			commandFailed(st, "startpipeline", "cannot use pipeline mode with the simple query protocol");
@@ -6465,6 +7011,8 @@ printResults(StatsData *total,
 			   PARTITION_METHOD[partition_method], partitions);
 	printf("query mode: %s\n", QUERYMODE[querymode]);
 	printf("number of clients: %d\n", nclients);
+	if (pipeline_depth > 0)
+		printf("pipeline depth: %d\n", pipeline_depth);
 	printf("number of threads: %d\n", nthreads);
 
 	if (max_tries)
@@ -6772,6 +7320,7 @@ main(int argc, char **argv)
 		{"exit-on-abort", no_argument, NULL, 16},
 		{"debug", no_argument, NULL, 17},
 		{"continue-on-error", no_argument, NULL, 18},
+		{"pipeline-depth", required_argument, NULL, 19},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -7132,6 +7681,18 @@ main(int argc, char **argv)
 				benchmarking_option_set = true;
 				continue_on_error = true;
 				break;
+			case 19:			/* pipeline-depth */
+				benchmarking_option_set = true;
+				{
+					char	   *end;
+
+					errno = 0;
+					pipeline_depth = strtol(optarg, &end, 10);
+					if (errno != 0 || *end != '\0' || pipeline_depth < 0)
+						pg_fatal("invalid value for option %s: \"%s\"",
+								 "--pipeline-depth", optarg);
+				}
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -7286,6 +7847,34 @@ main(int argc, char **argv)
 			pg_fatal("an unlimited number of transaction tries can only be used with --latency-limit or a duration (-T)");
 	}
 
+	if (pipeline_depth > 0)
+	{
+		if (querymode == QUERY_SIMPLE)
+			pg_fatal("--pipeline-depth requires -M extended or -M prepared");
+		if (is_connect)
+			pg_fatal("--pipeline-depth cannot be used with -C/--connect");
+		if (throttle_delay)
+			pg_fatal("--pipeline-depth cannot be used with -R/--rate");
+		if (max_tries != 1)
+			pg_fatal("--pipeline-depth cannot be used with --max-tries");
+		if (latency_limit)
+			pg_fatal("--pipeline-depth cannot be used with -L/--latency-limit");
+
+		for (i = 0; i < num_scripts; i++)
+		{
+			Command   **commands = sql_script[i].commands;
+
+			for (int j = 0; commands[j] != NULL; j++)
+			{
+				if (commands[j]->type == META_COMMAND &&
+					(commands[j]->meta == META_STARTPIPELINE ||
+					 commands[j]->meta == META_SYNCPIPELINE ||
+					 commands[j]->meta == META_ENDPIPELINE))
+					pg_fatal("--pipeline-depth cannot be used with scripts that contain \\startpipeline, \\syncpipeline, or \\endpipeline");
+			}
+		}
+	}
+
 	/*
 	 * save main process id in the global variable because process id will be
 	 * changed after fork.
@@ -7328,6 +7917,8 @@ main(int argc, char **argv)
 	{
 		state[i].cstack = conditional_stack_create();
 		initRandomState(&state[i].cs_func_rs);
+		if (pipeline_depth > 0)
+			initPipelineBuffers(&state[i]);
 	}
 
 	/* opening connection... */
@@ -7631,6 +8222,7 @@ threadRun(void *arg)
 					min_usec = this_usec;
 			}
 			else if (st->state == CSTATE_WAIT_RESULT ||
+					 st->state == CSTATE_WAIT_PIPELINE_TX ||
 					 st->state == CSTATE_WAIT_ROLLBACK_RESULT)
 			{
 				/*
@@ -7646,6 +8238,21 @@ threadRun(void *arg)
 				}
 
 				add_socket_to_set(sockets, sock, nsocks++);
+
+				/*
+				 * Always bound the wait for --pipeline-depth clients, not
+				 * just once timer_exceeded is observed.  timer_exceeded is
+				 * flipped by a signal handler delivered to a single thread;
+				 * a different thread already parked in this poll/select
+				 * call would never notice the flag change and could block
+				 * indefinitely if no further data happens to arrive on its
+				 * sockets.  Waking at least once per second lets every
+				 * thread re-check timer_exceeded itself and lets the
+				 * CSTATE_WAIT_PIPELINE_TX stall watchdog fire promptly.
+				 */
+				if (st->state == CSTATE_WAIT_PIPELINE_TX &&
+					min_usec > INT64CONST(1000000))
+					min_usec = INT64CONST(1000000);
 			}
 			else if (st->state != CSTATE_ABORTED &&
 					 st->state != CSTATE_FINISHED)
@@ -7721,10 +8328,13 @@ threadRun(void *arg)
 			CState	   *st = &state[i];
 
 			if (st->state == CSTATE_WAIT_RESULT ||
+				st->state == CSTATE_WAIT_PIPELINE_TX ||
 				st->state == CSTATE_WAIT_ROLLBACK_RESULT)
 			{
 				/* don't call advanceConnectionState unless data is available */
 				int			sock = PQsocket(st->con);
+				bool		force_tick;
+				bool		ready;
 
 				if (sock < 0)
 				{
@@ -7732,7 +8342,16 @@ threadRun(void *arg)
 					goto done;
 				}
 
-				if (!socket_has_input(sockets, sock, nsocks++))
+				/*
+				 * After cutoff, still tick WAIT_PIPELINE_TX clients with no
+				 * input so the stall watchdog can flush/abandon.
+				 */
+				force_tick = (timer_exceeded &&
+							  st->state == CSTATE_WAIT_PIPELINE_TX);
+				ready = force_tick ||
+					socket_has_input(sockets, sock, nsocks);
+				nsocks++;
+				if (!ready)
 					continue;
 			}
 			else if (st->state == CSTATE_FINISHED ||
